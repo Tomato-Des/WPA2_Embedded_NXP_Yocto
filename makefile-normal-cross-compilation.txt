@@ -1,0 +1,106 @@
+# Makefile for WPA2 Security Auditor
+# Target: NXP i.MX93 EVK
+
+CXX = g++
+CXXFLAGS = -std=c++11 -Wall -Wextra -O2
+LDFLAGS = -lpcap -lssl -lcrypto
+
+TARGET = wpa2_auditor
+OBJS = main.o hardware.o wifi.o cracker.o
+
+# Python helper script
+PYTHON_SCRIPT = oled_display.py
+
+all: $(TARGET) $(PYTHON_SCRIPT)
+	@echo "Build complete!"
+	@echo "Make sure $(PYTHON_SCRIPT) is executable:"
+	@echo "  chmod +x $(PYTHON_SCRIPT)"
+
+$(TARGET): $(OBJS)
+	$(CXX) $(OBJS) -o $(TARGET) $(LDFLAGS)
+	@echo "Linking complete: $(TARGET)"
+
+main.o: main.cpp hardware.h wifi.h cracker.h
+	$(CXX) $(CXXFLAGS) -c main.cpp
+
+hardware.o: hardware.cpp hardware.h
+	$(CXX) $(CXXFLAGS) -c hardware.cpp
+
+wifi.o: wifi.cpp wifi.h
+	$(CXX) $(CXXFLAGS) -c wifi.cpp
+
+cracker.o: cracker.cpp cracker.h wifi.h
+	$(CXX) $(CXXFLAGS) -c cracker.cpp
+
+$(PYTHON_SCRIPT):
+	@if [ ! -f $(PYTHON_SCRIPT) ]; then \
+		echo "ERROR: $(PYTHON_SCRIPT) not found!"; \
+		exit 1; \
+	fi
+	chmod +x $(PYTHON_SCRIPT)
+
+clean:
+	rm -f $(OBJS) $(TARGET)
+	@echo "Clean complete"
+
+install: all
+	@echo "Installing to /usr/local/bin..."
+	@sudo cp $(TARGET) /usr/local/bin/
+	@sudo cp $(PYTHON_SCRIPT) /usr/local/bin/
+	@echo "Installation complete"
+	@echo "Run with: sudo wpa2_auditor"
+
+uninstall:
+	@echo "Uninstalling..."
+	@sudo rm -f /usr/local/bin/$(TARGET)
+	@sudo rm -f /usr/local/bin/$(PYTHON_SCRIPT)
+	@echo "Uninstall complete"
+
+# Development helpers
+run: all
+	@echo "Running $(TARGET) (requires root)..."
+	sudo ./$(TARGET)
+
+test-oled:
+	@echo "Testing OLED display..."
+	./$(PYTHON_SCRIPT) message "Test" "Line 1" "Line 2" "Line 3"
+
+test-leds:
+	@echo "Testing LEDs..."
+	@echo "Red..."
+	@echo 255 > /sys/class/leds/wpa2:red:status/brightness
+	@sleep 1
+	@echo 0 > /sys/class/leds/wpa2:red:status/brightness
+	@echo "Yellow..."
+	@echo 255 > /sys/class/leds/wpa2:yellow:status/brightness
+	@sleep 1
+	@echo 0 > /sys/class/leds/wpa2:yellow:status/brightness
+	@echo "Green..."
+	@echo 255 > /sys/class/leds/wpa2:green:status/brightness
+	@sleep 1
+	@echo 0 > /sys/class/leds/wpa2:green:status/brightness
+	@echo "Blue..."
+	@echo 255 > /sys/class/leds/wpa2:blue:status/brightness
+	@sleep 1
+	@echo 0 > /sys/class/leds/wpa2:blue:status/brightness
+	@echo "LED test complete"
+
+help:
+	@echo "WPA2 Security Auditor - Makefile"
+	@echo ""
+	@echo "Targets:"
+	@echo "  all        - Build the application (default)"
+	@echo "  clean      - Remove build artifacts"
+	@echo "  run        - Build and run (requires root)"
+	@echo "  install    - Install to /usr/local/bin"
+	@echo "  uninstall  - Remove from /usr/local/bin"
+	@echo "  test-oled  - Test OLED display"
+	@echo "  test-leds  - Test LED indicators"
+	@echo "  help       - Show this message"
+	@echo ""
+	@echo "Requirements:"
+	@echo "  - libpcap-dev"
+	@echo "  - libssl-dev"
+	@echo "  - Python 3 with luma.oled"
+
+.PHONY: all clean install uninstall run test-oled test-leds help
