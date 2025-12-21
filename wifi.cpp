@@ -86,11 +86,16 @@ void WiFiController::restore_managed_mode() {
 }
 
 bool WiFiController::set_channel(int channel) {
-    std::string cmd = "iw dev " + interface + " set channel " + 
+    std::string cmd = "iw dev " + interface + " set channel " +
                       std::to_string(channel) + " 2>&1";
-    bool success = system(cmd.c_str()) == 0;
+    int result = system(cmd.c_str());
+    bool success = (result == 0);
+
     if (success) {
         std::cout << "[INFO] Set channel to " << channel << std::endl;
+    } else {
+        std::cerr << "[ERROR] Failed to set channel " << channel
+                  << " (exit code: " << result << ")" << std::endl;
     }
     return success;
 }
@@ -187,88 +192,199 @@ bool PacketProcessor::parse_beacon(const uint8_t* packet, int len, WiFiNetwork& 
 
 bool PacketProcessor::is_eapol_frame(const uint8_t* packet, int len) {
     if (len < 32) return false;
-    
-    // Check for QoS Data frame
+
+    // Check for Data frame (type bits 2-3 should be 10)
     uint8_t frame_type = packet[0];
     if ((frame_type & 0x0C) != 0x08) return false; // Not data frame
-    
-    // Check for LLC/SNAP header + EtherType 0x888E (EAPOL)
-    // QoS Data frame has header at offset 24 + 2 (QoS) = 26
-    int llc_offset = 26;
+
+    // Determine 802.11 header size based on frame control flags
+    uint8_t frame_ctrl_lo = packet[0];
+    uint8_t frame_ctrl_hi = packet[1];
+
+    bool to_ds = (frame_ctrl_hi & 0x01) != 0;
+    bool from_ds = (frame_ctrl_hi & 0x02) != 0;
+    bool is_qos = (frame_ctrl_lo & 0x80) != 0;  // Subtype bit 7
+
+    int header_size = 24;  // Base 802.11 header
+
+    // Add Address 4 if both ToDS and FromDS are set (WDS)
+    if (to_ds && from_ds) {
+        header_size += 6;
+    }
+
+    // Add QoS Control field if QoS data frame
+    if (is_qos) {
+        header_size += 2;
+    }
+
+    int llc_offset = header_size;
     if (len < llc_offset + 8) return false;
-    
+
     // Check LLC/SNAP: AA-AA-03-00-00-00-88-8E
-    return packet[llc_offset] == 0xAA && 
-           packet[llc_offset + 1] == 0xAA &&
-           packet[llc_offset + 2] == 0x03 &&
-           packet[llc_offset + 6] == 0x88 && 
-           packet[llc_offset + 7] == 0x8E;
+    bool is_eapol = packet[llc_offset] == 0xAA &&
+                    packet[llc_offset + 1] == 0xAA &&
+                    packet[llc_offset + 2] == 0x03 &&
+                    packet[llc_offset + 6] == 0x88 &&
+                    packet[llc_offset + 7] == 0x8E;
+
+    if (is_eapol) {
+        std::cout << "[DEBUG] EAPOL detected! FC=" << std::hex << (int)frame_ctrl_lo
+                  << " " << (int)frame_ctrl_hi << std::dec
+                  << " ToDS=" << to_ds << " FromDS=" << from_ds << " QoS=" << is_qos
+                  << " HdrSize=" << header_size << " len=" << len << std::endl;
+    }
+
+    return is_eapol;
 }
 
 int PacketProcessor::get_eapol_message_type(const uint8_t* packet, int len) {
-    // Assume QoS Data frame (most common for WPA2 handshakes)
-    // 802.11 header sizes:
-    //   - Basic Data frame: 24 bytes
-    //   - QoS Data frame: 26 bytes (24 + 2 QoS Control)
-    //   - Data frame with Address 4 (WDS): 30 bytes (24 + 6)
-    //   - QoS + Address 4: 32 bytes (24 + 6 + 2)
-    // LLC/SNAP header: 8 bytes (always present for EAPOL)
-    int eapol_offset = 26 + 8; // QoS (26) + LLC/SNAP (8)
-    if (len < eapol_offset + 97) return 0; // Need at least 97 bytes for MIC access
-    
+    if (len < 32) {
+        std::cout << "[DEBUG] get_eapol_message_type: packet too short (" << len << " bytes)" << std::endl;
+        return 0;
+    }
+
+    // Calculate 802.11 header size dynamically
+    uint8_t frame_ctrl_lo = packet[0];
+    uint8_t frame_ctrl_hi = packet[1];
+
+    bool to_ds = (frame_ctrl_hi & 0x01) != 0;
+    bool from_ds = (frame_ctrl_hi & 0x02) != 0;
+    bool is_qos = (frame_ctrl_lo & 0x80) != 0;
+
+    int header_size = 24;
+    if (to_ds && from_ds) header_size += 6;  // WDS
+    if (is_qos) header_size += 2;             // QoS Control
+
+    // LLC/SNAP is 8 bytes
+    int eapol_offset = header_size + 8;
+    if (len < eapol_offset + 97) {
+        std::cout << "[DEBUG] get_eapol_message_type: packet too short for MIC (need "
+                  << (eapol_offset + 97) << ", have " << len << ")" << std::endl;
+        return 0;
+    }
+
     const uint8_t* eapol = packet + eapol_offset;
-    
+
     // Verify EAPOL-Key frame
-    if (eapol[1] != 0x03) return 0; // Not Key frame
-    if (eapol[4] != 0x02) return 0; // Not WPA Key descriptor
-    
+    if (eapol[1] != 0x03) {
+        std::cout << "[DEBUG] get_eapol_message_type: not Key frame (type=" << (int)eapol[1] << ")" << std::endl;
+        return 0;
+    }
+    if (eapol[4] != 0x02) {
+        std::cout << "[DEBUG] get_eapol_message_type: not WPA Key descriptor (desc=" << (int)eapol[4] << ")" << std::endl;
+        return 0;
+    }
+
     // Parse Key Information field (big endian)
     uint16_t key_info = (eapol[5] << 8) | eapol[6];
-    
+
     bool has_mic = (key_info & 0x0100) != 0;
     bool has_install = (key_info & 0x0040) != 0;
     bool is_pairwise = (key_info & 0x0008) != 0;
-    
-    if (!is_pairwise) return 0;
-    
-    if (!has_mic && !has_install) return 1; // Message 1
-    if (has_mic && !has_install) return 2;  // Message 2 (or 4, but we use 2)
-    if (has_mic && has_install) return 3;   // Message 3
-    
-    return 0;
+
+    std::cout << "[DEBUG] EAPOL Key Info: 0x" << std::hex << key_info << std::dec
+              << " MIC=" << has_mic << " Install=" << has_install
+              << " Pairwise=" << is_pairwise << std::endl;
+
+    if (!is_pairwise) {
+        std::cout << "[DEBUG] get_eapol_message_type: not pairwise key" << std::endl;
+        return 0;
+    }
+
+    int msg_type = 0;
+    if (!has_mic && !has_install) msg_type = 1; // Message 1
+    else if (has_mic && !has_install) msg_type = 2;  // Message 2 (or 4, but we use 2)
+    else if (has_mic && has_install) msg_type = 3;   // Message 3
+
+    std::cout << "[DEBUG] Detected EAPOL Message Type: " << msg_type << std::endl;
+
+    return msg_type;
 }
 
 bool PacketProcessor::parse_eapol_msg1(const uint8_t* packet, int len, WiFiNetwork& net) {
-    int eapol_offset = 26 + 8;
-    if (len < eapol_offset + 49) return false; // Need ANonce at offset 17-48
-    
+    std::cout << "[DEBUG] parse_eapol_msg1: parsing message 1 (len=" << len << ")" << std::endl;
+
+    if (len < 32) {
+        std::cout << "[DEBUG] parse_eapol_msg1: packet too short" << std::endl;
+        return false;
+    }
+
+    // Calculate header size dynamically
+    uint8_t frame_ctrl_lo = packet[0];
+    uint8_t frame_ctrl_hi = packet[1];
+    bool to_ds = (frame_ctrl_hi & 0x01) != 0;
+    bool from_ds = (frame_ctrl_hi & 0x02) != 0;
+    bool is_qos = (frame_ctrl_lo & 0x80) != 0;
+
+    int header_size = 24;
+    if (to_ds && from_ds) header_size += 6;
+    if (is_qos) header_size += 2;
+
+    int eapol_offset = header_size + 8;
+    if (len < eapol_offset + 49) {
+        std::cout << "[DEBUG] parse_eapol_msg1: packet too short for ANonce (need "
+                  << (eapol_offset + 49) << ", have " << len << ")" << std::endl;
+        return false;
+    }
+
     const uint8_t* eapol = packet + eapol_offset;
-    
+
     // Extract ANonce (offset 17, length 32)
     memcpy(net.anonce, eapol + 17, 32);
-    
+
     // Extract AP MAC (Address 3 - BSSID)
     memcpy(net.ap_mac, packet + 16, 6);
-    
+
     // Extract Client MAC (Address 1 - Destination) - first handshake client
     memcpy(net.client_mac, packet + 4, 6);
-    
+
     // Save full EAPOL frame
     net.eapol_msg1.assign(eapol, eapol + (len - eapol_offset));
-    
+
+    std::cout << "[DEBUG] parse_eapol_msg1: SUCCESS - AP=" << std::hex
+              << (int)net.ap_mac[0] << ":" << (int)net.ap_mac[1] << ":" << (int)net.ap_mac[2] << ":"
+              << (int)net.ap_mac[3] << ":" << (int)net.ap_mac[4] << ":" << (int)net.ap_mac[5]
+              << " Client=" << (int)net.client_mac[0] << ":" << (int)net.client_mac[1] << ":"
+              << (int)net.client_mac[2] << ":" << (int)net.client_mac[3] << ":"
+              << (int)net.client_mac[4] << ":" << (int)net.client_mac[5] << std::dec
+              << " ANonce[0-3]=" << std::hex << (int)net.anonce[0] << (int)net.anonce[1]
+              << (int)net.anonce[2] << (int)net.anonce[3] << std::dec << std::endl;
+
     return true;
 }
 
 bool PacketProcessor::parse_eapol_msg2(const uint8_t* packet, int len, WiFiNetwork& net) {
-    int eapol_offset = 26 + 8;
-    if (len < eapol_offset + 97) return false; // Need MIC at offset 81-96
-    
+    std::cout << "[DEBUG] parse_eapol_msg2: parsing message 2 (len=" << len << ")" << std::endl;
+
+    if (len < 32) {
+        std::cout << "[DEBUG] parse_eapol_msg2: packet too short" << std::endl;
+        return false;
+    }
+
+    // Calculate header size dynamically
+    uint8_t frame_ctrl_lo = packet[0];
+    uint8_t frame_ctrl_hi = packet[1];
+    bool to_ds = (frame_ctrl_hi & 0x01) != 0;
+    bool from_ds = (frame_ctrl_hi & 0x02) != 0;
+    bool is_qos = (frame_ctrl_lo & 0x80) != 0;
+
+    int header_size = 24;
+    if (to_ds && from_ds) header_size += 6;
+    if (is_qos) header_size += 2;
+
+    int eapol_offset = header_size + 8;
+    if (len < eapol_offset + 97) {
+        std::cout << "[DEBUG] parse_eapol_msg2: packet too short for MIC (need "
+                  << (eapol_offset + 97) << ", have " << len << ")" << std::endl;
+        return false;
+    }
+
     const uint8_t* eapol = packet + eapol_offset;
-    
+
     // Extract current packet's client MAC (Address 2 - Source)
     uint8_t current_client_mac[6];
     memcpy(current_client_mac, packet + 10, 6);
-    
+
     // Check if we already have a client MAC stored (from msg1)
     bool client_mac_is_set = false;
     for (int i = 0; i < 6; i++) {
@@ -277,31 +393,47 @@ bool PacketProcessor::parse_eapol_msg2(const uint8_t* packet, int len, WiFiNetwo
             break;
         }
     }
-    
+
     if (!client_mac_is_set) {
-        // No client MAC stored yet, meaning msg1 not received
-        // Must receive msg1 before msg2, reject this
+        std::cout << "[DEBUG] parse_eapol_msg2: REJECTED - no msg1 received yet (client_mac not set)" << std::endl;
         return false;
     }
-    
+
     // Client MAC is set, verify this packet is from the same client
     if (memcmp(net.client_mac, current_client_mac, 6) != 0) {
-        // Different client, ignore this message
+        std::cout << "[DEBUG] parse_eapol_msg2: REJECTED - different client MAC" << std::endl;
+        std::cout << "[DEBUG]   Expected: " << std::hex
+                  << (int)net.client_mac[0] << ":" << (int)net.client_mac[1] << ":"
+                  << (int)net.client_mac[2] << ":" << (int)net.client_mac[3] << ":"
+                  << (int)net.client_mac[4] << ":" << (int)net.client_mac[5] << std::endl;
+        std::cout << "[DEBUG]   Got:      " << std::hex
+                  << (int)current_client_mac[0] << ":" << (int)current_client_mac[1] << ":"
+                  << (int)current_client_mac[2] << ":" << (int)current_client_mac[3] << ":"
+                  << (int)current_client_mac[4] << ":" << (int)current_client_mac[5] << std::dec << std::endl;
         return false;
     }
-    
+
     // Extract AP MAC (Address 3 - BSSID)
     memcpy(net.ap_mac, packet + 16, 6);
-    
+
     // Extract SNonce (offset 17, length 32)
     memcpy(net.snonce, eapol + 17, 32);
-    
+
     // Extract MIC (offset 81, length 16)
     memcpy(net.mic, eapol + 81, 16);
-    
+
     // Save full EAPOL frame
     net.eapol_msg2.assign(eapol, eapol + (len - eapol_offset));
-    
+
+    std::cout << "[DEBUG] parse_eapol_msg2: SUCCESS - Client=" << std::hex
+              << (int)current_client_mac[0] << ":" << (int)current_client_mac[1] << ":"
+              << (int)current_client_mac[2] << ":" << (int)current_client_mac[3] << ":"
+              << (int)current_client_mac[4] << ":" << (int)current_client_mac[5] << std::dec
+              << " SNonce[0-3]=" << std::hex << (int)net.snonce[0] << (int)net.snonce[1]
+              << (int)net.snonce[2] << (int)net.snonce[3]
+              << " MIC[0-3]=" << (int)net.mic[0] << (int)net.mic[1]
+              << (int)net.mic[2] << (int)net.mic[3] << std::dec << std::endl;
+
     return true;
 }
 
@@ -337,35 +469,36 @@ void PacketProcessor::extract_addresses(const uint8_t* packet, int len,
     }
 }
 
-std::vector<uint8_t> PacketProcessor::craft_deauth_frame(const uint8_t* ap_mac, 
-                                                         const uint8_t* client_mac) {
+std::vector<uint8_t> PacketProcessor::craft_deauth_frame(const uint8_t* src_mac,
+                                                         const uint8_t* dst_mac,
+                                                         const uint8_t* bssid) {
     std::vector<uint8_t> frame(26);
-    
+
     // Frame Control: Deauthentication (0xC0 0x00)
     frame[0] = 0xC0;
     frame[1] = 0x00;
-    
+
     // Duration
     frame[2] = 0x3A;
     frame[3] = 0x01;
-    
-    // Address 1: Destination (client)
-    memcpy(&frame[4], client_mac, 6);
-    
-    // Address 2: Source (AP)
-    memcpy(&frame[10], ap_mac, 6);
-    
-    // Address 3: BSSID (AP)
-    memcpy(&frame[16], ap_mac, 6);
-    
+
+    // Address 1: Destination
+    memcpy(&frame[4], dst_mac, 6);
+
+    // Address 2: Source
+    memcpy(&frame[10], src_mac, 6);
+
+    // Address 3: BSSID (MUST always be AP's BSSID per 802.11 standard)
+    memcpy(&frame[16], bssid, 6);
+
     // Sequence control (will be filled by driver)
     frame[22] = 0x00;
     frame[23] = 0x00;
-    
+
     // Reason code: Class 3 frame from non-associated STA (0x07)
     frame[24] = 0x07;
     frame[25] = 0x00;
-    
+
     return frame;
 }
 
@@ -395,4 +528,58 @@ bool is_printable_ssid(const std::string& ssid) {
 
 bool compare_mac(const uint8_t* mac1, const uint8_t* mac2) {
     return memcmp(mac1, mac2, 6) == 0;
+}
+
+bool normalize_80211_frame(pcap_t* handle,
+                           const uint8_t* packet, int len,
+                           const uint8_t*& out_pkt, int& out_len) {
+    out_pkt = packet;
+    out_len = len;
+
+    if (!handle || !packet || len <= 0) return false;
+
+    int dlt = pcap_datalink(handle);
+
+    // Monitor mode on ath9k_htc (AR9271) → radiotap header
+    if (dlt == DLT_IEEE802_11_RADIO) {
+        if (len < 4) {
+            std::cout << "[DEBUG] normalize: packet too short for radiotap header (len=" << len << ")\n";
+            return false;
+        }
+        uint8_t ver = packet[0];
+        if (ver != 0) {
+            std::cout << "[DEBUG] normalize: bad radiotap version=" << (int)ver << "\n";
+            return false;
+        }
+
+        // Radiotap header length is at bytes 2-3 (little endian)
+        int rt_len = packet[2] | (packet[3] << 8);
+
+        // FIXED: Allow rt_len == len (control frames with no payload)
+        if (rt_len <= 0 || rt_len > len) {
+            std::cout << "[DEBUG] normalize: invalid radiotap length (rt_len=" << rt_len
+                      << ", packet_len=" << len << ")\n";
+            return false;
+        }
+
+        // Skip radiotap header to get raw 802.11 frame
+        out_pkt = packet + rt_len;
+        out_len = len - rt_len;
+
+        // Debug: Log what we're stripping
+        if (out_len == 0) {
+            std::cout << "[DEBUG] normalize: WARNING - no 802.11 data after radiotap (rt_len="
+                      << rt_len << ", total=" << len << ")\n";
+        }
+
+        return true;
+    }
+
+    // Already raw 802.11
+    if (dlt == DLT_IEEE802_11) {
+        return true;
+    }
+
+    // Unknown data link type
+    return false;
 }

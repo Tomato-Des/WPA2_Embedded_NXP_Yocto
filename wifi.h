@@ -78,8 +78,9 @@ public:
                                   uint8_t* ap_mac, uint8_t* client_mac);
     
     // Deauth frame crafting
-    static std::vector<uint8_t> craft_deauth_frame(const uint8_t* ap_mac, 
-                                                   const uint8_t* client_mac);
+    static std::vector<uint8_t> craft_deauth_frame(const uint8_t* src_mac,
+                                                   const uint8_t* dst_mac,
+                                                   const uint8_t* bssid);
 };
 
 // ==================== Utility Functions ====================
@@ -87,5 +88,10 @@ std::string mac_to_string(const uint8_t* mac);
 std::string bytes_to_hex(const uint8_t* data, size_t len);
 bool is_printable_ssid(const std::string& ssid);
 bool compare_mac(const uint8_t* mac1, const uint8_t* mac2);
+
+// Radiotap header stripping for monitor mode
+bool normalize_80211_frame(pcap_t* handle,
+                           const uint8_t* packet, int len,
+                           const uint8_t*& out_pkt, int& out_len);
 
 #endif // WIFI_H

