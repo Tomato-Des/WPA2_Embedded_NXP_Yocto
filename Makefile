@@ -7,7 +7,7 @@ LDFLAGS ?=
 LDLIBS ?= -lpcap -lssl -lcrypto
 
 TARGET = wpa2_auditor
-OBJS = ignore.o hardware.o wifi.o cracker.o
+OBJS = main.o hardware.o wifi.o cracker.o
 
 # Python helper script
 PYTHON_SCRIPT = oled_display.py
@@ -18,8 +18,8 @@ $(TARGET): $(OBJS)
 	$(CXX) $(LDFLAGS) $(OBJS) -o $(TARGET) $(LDLIBS)
 	@echo "Linking complete: $(TARGET)"
 
-ignore.o: ignore.cpp hardware.h wifi.h cracker.h
-	$(CXX) $(CXXFLAGS) -c ignore.cpp
+main.o: main.cpp hardware.h wifi.h cracker.h
+	$(CXX) $(CXXFLAGS) -c main.cpp
 
 hardware.o: hardware.cpp hardware.h
 	$(CXX) $(CXXFLAGS) -c hardware.cpp

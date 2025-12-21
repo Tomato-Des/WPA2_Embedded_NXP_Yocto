@@ -1,0 +1,187 @@
+================================================================================
+                    WPA2 AUDITOR - LED STATE FLOW
+                    NXP i.MX93 EVK Platform
+================================================================================
+
+COMPLETE LED STATE FLOW (Start to End)
+================================================================================
+
+1. APPLICATION STARTUP
+   LED State: ALL OFF
+   Duration: During initialization and startup menu display
+   Trigger: Program start
+
+2. ERROR STATES (Initialization Failures)
+   LED State: RED SOLID ON
+   Duration: Until program exits
+   Triggers:
+   - Monitor mode setup failure
+   - Channel switch failure
+   - Packet capture failure
+
+3. SCANNING STATE
+   LED State: YELLOW BLINKING (500ms interval)
+   Duration: ~3-4 seconds (scanning channels 1, 3, 5, 7, 9, 11)
+   Trigger: Scanning for WPA2 networks
+   Code: Line 45-46 (leds.all_off() → leds.set_blink(YELLOW, 500))
+
+4. NETWORK SELECTION MENU
+   LED State: YELLOW SOLID ON
+   Duration: Until user selects network or auto-rescan (15 seconds)
+   Trigger: Displaying found networks menu
+   Code: Line 505 (leds.set_solid(YELLOW, true))
+
+5. HANDSHAKE CAPTURE STATE
+   LED State: BLUE BLINKING (500ms interval)
+   Duration: Up to 60 seconds or until handshake captured
+   Triggers:
+   - "Deauth Attack" mode selected
+   - "Wait Handshake" mode selected
+   Code: Line 208-209 (leds.all_off() → leds.set_blink(BLUE, 500))
+
+6. HANDSHAKE CAPTURED SUCCESS
+   LED State: BLUE SOLID ON
+   Duration: 2 seconds + dictionary menu display time
+   Trigger: Complete handshake (Message 1 + Message 2) captured
+   Code: Line 665-666 (leds.all_off() → leds.set_solid(BLUE, true))
+
+7. PASSWORD CRACKING STATE
+   LED State: RED BLINKING (1000ms / 1 second interval)
+   Duration: Until password found or dictionary exhausted
+   Trigger: Dictionary file selected and cracking begins
+   Code: Line 696-697 (leds.all_off() → leds.set_blink(RED, 1000))
+
+8A. CRACKING SUCCESS
+   LED State: GREEN BLINKING (1000ms / 1 second interval)
+   Duration: Until user chooses "Re-scan" or "Exit"
+   Trigger: Password successfully cracked
+   Code: Line 721-722 (leds.all_off() → leds.set_blink(GREEN, 1000))
+
+8B. CRACKING FAILURE
+   LED State: RED SOLID ON
+   Duration: Until user presses SELECT button
+   Trigger: Password not found in dictionary
+   Code: Line 748-749 (leds.all_off() → leds.set_solid(RED, true))
+
+9. LOOP BACK TO SCANNING
+   LED State: YELLOW BLINKING (500ms interval)
+   Returns to State #3
+   Trigger: User chooses "Re-scan" from success/failure menu
+
+10. PROGRAM EXIT
+   LED State: ALL OFF
+   Triggers:
+   - User exits via menu
+   - Double ESC pressed
+   - Signal received (Ctrl+C)
+   Code: leds.all_off() called before exit
+
+================================================================================
+LED COLOR & PATTERN MEANING SUMMARY
+================================================================================
+
+┌─────────────┬──────────────────┬────────────────────────────────────┐
+│ LED COLOR   │ PATTERN          │ STATE                              │
+├─────────────┼──────────────────┼────────────────────────────────────┤
+│ YELLOW      │ Blinking (500ms) │ Scanning for networks              │
+│ YELLOW      │ Solid            │ Network selection menu             │
+│ BLUE        │ Blinking (500ms) │ Capturing handshake                │
+│ BLUE        │ Solid            │ Handshake captured successfully    │
+│ RED         │ Blinking (1000ms)│ Cracking password                  │
+│ RED         │ Solid            │ Error state OR cracking failed     │
+│ GREEN       │ Blinking (1000ms)│ Password cracked successfully      │
+└─────────────┴──────────────────┴────────────────────────────────────┘
+
+================================================================================
+KEY IMPLEMENTATION DETAILS
+================================================================================
+
+State Transition Guarantee:
+- Every state transition calls leds.all_off() BEFORE setting new LED state
+- Only ONE LED is active at any time (no accumulation/overlap)
+- Clean state machine with proper cleanup
+
+Blinking Intervals:
+- Fast blink (500ms):  Yellow/Blue LEDs (scanning, capturing)
+- Slow blink (1000ms): Red/Green LEDs (cracking, success)
+
+Pattern Usage:
+- SOLID:    Waiting for user input OR error condition
+- BLINKING: Activity in progress (scanning, capturing, cracking)
+
+Signal Handling:
+- SIGINT (Ctrl+C) and SIGTERM properly turn off all LEDs
+- Exception handler ensures all_off() is called on fatal errors
+
+LED Controller Methods Used:
+- leds.all_off()                    → Turn off all LEDs
+- leds.set_blink(color, interval)   → Set LED to blink at interval
+- leds.set_solid(color, true)       → Set LED to solid on
+
+Available LED Colors (from LEDController class):
+- LEDController::YELLOW
+- LEDController::BLUE
+- LEDController::RED
+- LEDController::GREEN
+
+================================================================================
+VISUAL STATE FLOW DIAGRAM
+================================================================================
+
+    [START]
+       │
+       ▼
+   ALL OFF ──────────────────┐
+       │                     │
+       ▼                     │
+   YELLOW BLINK        [INIT ERROR]
+   (Scanning)               │
+       │                    ▼
+       ▼                RED SOLID
+   YELLOW SOLID         (Fatal)
+   (Menu)                   │
+       │                    ▼
+       ▼                 [EXIT]
+   BLUE BLINK
+   (Capturing) ──────> [TIMEOUT]
+       │                    │
+       ▼                    │
+   BLUE SOLID               │
+   (Captured)               │
+       │                    │
+       ▼                    │
+   RED BLINK                │
+   (Cracking)               │
+       │                    │
+       ├──────────┬─────────┤
+       ▼          ▼         ▼
+   GREEN BLINK   RED SOLID  │
+   (Success)     (Failed)   │
+       │          │         │
+       └──────────┴─────────┘
+                  │
+                  ▼
+              ALL OFF
+                  │
+                  ▼
+               [EXIT]
+
+================================================================================
+TROUBLESHOOTING
+================================================================================
+
+Problem: LEDs stay on after state change
+Fix: Check that leds.all_off() is called before each new state
+
+Problem: Multiple LEDs on at once
+Fix: Verify state transitions are sequential, not overlapping
+
+Problem: LED doesn't turn off on exit
+Fix: Check signal handlers and exception handlers call leds.all_off()
+
+Problem: Wrong LED color for state
+Fix: Verify LED color constants match hardware wiring
+
+================================================================================
+END OF DOCUMENT
+================================================================================

