@@ -9,8 +9,8 @@
 #include <cstring>
 
 // ==================== Constants ====================
-const int SCAN_CHANNELS[] = {1, 3, 5, 7, 9, 11};
-const int CHANNEL_COUNT = 6;
+const int SCAN_CHANNELS[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+const int CHANNEL_COUNT = 11;
 const int CHANNEL_DWELL_MS = 500000; // 0.5 seconds in microseconds
 const int RESCAN_INTERVAL_SEC = 15;
 
@@ -562,9 +562,9 @@ int main() {
                                 if (ssid_idx == 0) {
                                     // Deauth attack - need to find clients first
                                     std::cout << "[STATE] Scanning for clients..." << std::endl;
-                                    oled.show_message("Scanning", {"Finding clients..."});
-                                    
-                                    if (!find_clients(wifi, target, clients, 5)) {
+                                    oled.show_message("Scanning", {"Finding clients...", "Wait 18 seconds"});
+
+                                    if (!find_clients(wifi, target, clients, 18)) {
                                         std::cout << "[INFO] No clients detected" << std::endl;
                                         oled.show_message("No Clients", {"None detected", "Press SELECT"});
                                         

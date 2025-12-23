@@ -38,23 +38,56 @@ class OLEDHelper:
         self.device.display(image)
     
     def show_menu(self, items, selected_idx):
-        """Display menu with selection indicator"""
+        """Display menu with selection indicator and scrolling"""
         print(f"[OLED_PY] show_menu called: selected_idx={selected_idx}, items={items}", file=sys.stderr)
-        
+
         def draw(draw):
+            # Calculate visible window (6 items fit on screen with 10px height each)
+            max_visible = 6
+            total_items = len(items)
+
+            # Calculate scroll offset to keep selected item visible
+            # If selected is in first 3 items, show from start
+            # If selected is in last 3 items, show last 6 items
+            # Otherwise, keep selected item in middle (position 3)
+            if total_items <= max_visible:
+                # All items fit on screen
+                start_idx = 0
+                end_idx = total_items
+            elif selected_idx < 3:
+                # Near the top
+                start_idx = 0
+                end_idx = min(max_visible, total_items)
+            elif selected_idx >= total_items - 3:
+                # Near the bottom
+                start_idx = max(0, total_items - max_visible)
+                end_idx = total_items
+            else:
+                # In the middle - keep selected at position 3
+                start_idx = selected_idx - 3
+                end_idx = min(start_idx + max_visible, total_items)
+
+            # Draw visible items
             y = 0
-            for idx, item in enumerate(items):
+            for idx in range(start_idx, end_idx):
                 prefix = "> " if idx == selected_idx else "  "
-                text = prefix + item
+                text = prefix + items[idx]
                 if len(text) > 21:
                     text = text[:20] + "..."
                 draw.text((0, y), text, fill="white")
                 y += 10
-                if y > 54:
-                    break
-        
+
+            # Draw scroll indicators if needed
+            if total_items > max_visible:
+                # Up arrow if there are items above
+                if start_idx > 0:
+                    draw.text((120, 0), "^", fill="white")
+                # Down arrow if there are items below
+                if end_idx < total_items:
+                    draw.text((120, 54), "v", fill="white")
+
         self._draw_and_display(draw)
-        print("[OLED_PY] show_menu completed", file=sys.stderr)
+        print(f"[OLED_PY] show_menu completed (showing items {start_idx if 'start_idx' in locals() else 0}-{end_idx if 'end_idx' in locals() else len(items)})", file=sys.stderr)
     
     def show_message(self, title, lines):
         """Display title and message lines"""

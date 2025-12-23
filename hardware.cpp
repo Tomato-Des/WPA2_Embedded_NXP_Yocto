@@ -123,19 +123,17 @@ OLEDDisplay::~OLEDDisplay() {
 }
 
 void OLEDDisplay::call_python(const std::string& command) {
-    std::string cmd = python_script + " " + command + " 2>&1";
-    std::cout << "[DEBUG] Calling Python: " << cmd << std::endl;
+    std::string cmd = python_script + " " + command + " 2>/dev/null";
     FILE* pipe = popen(cmd.c_str(), "r");
     if (pipe) {
-        // Read and print output
+        // Discard output silently
         char buffer[256];
         while (fgets(buffer, sizeof(buffer), pipe) != NULL) {
-            std::cout << "[PYTHON_OUTPUT] " << buffer;
+            // Do nothing - suppress output
         }
-        int status = pclose(pipe);
-        std::cout << "[DEBUG] Python exit status: " << status << std::endl;
+        pclose(pipe);
     } else {
-        std::cerr << "[ERROR] Failed to popen: " << cmd << std::endl;
+        std::cerr << "[ERROR] Failed to execute OLED command" << std::endl;
     }
 }
 
